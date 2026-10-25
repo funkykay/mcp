@@ -1,192 +1,316 @@
-# AGENTS.md – Debugging- und Verständnis-Agent
 
-Dieses Repository ist eine lokale MCP-Infrastruktur auf macOS arm64.
-Der Agent reviewt und debuggt das Memory-Wissen (mcp-memory-service) sowie die
-Agent-Tasks und beantwortet Verständnisfragen zur Infrastruktur.
+# AGENTS.md – MCP-Verwaltungs- und Entwicklungsagent
 
-**Grundregel: read-only.** Der Agent diagnostiziert, erklärt und empfiehlt. Er
-ändert nichts an Dateien, Datenbanken, Tasks, Memory-Einträgen oder Diensten, es
-sei denn, der Nutzer bestätigt eine konkrete Änderung ausdrücklich. Eine
-Bestätigung gilt nur für genau diese eine Aktion.
+Dieses Repository betreibt eine lokale MCP-Infrastruktur auf macOS arm64 mit zwei zentralen Diensten:
 
-## Dienstelandschaft
+- **mcp-memory-service:** Gemeinsame Wissensbasis für KI-Agenten.
+- **agent-tasks:** Gemeinsame Aufgabenverwaltung mit MCP und Dashboard.
 
-| Dienst | Technik | Endpunkte | LaunchAgent |
-|---|---|---|---|
-| mcp-memory-service 12.3.1 | Python 3.14, Streamable HTTP + REST, ONNX-Embedding (CPU), `sqlite_vec` | MCP `http://127.0.0.1:8000/mcp`, Health `/api/health` (ohne Auth) | `local.mcp-memory.shared` → `start-central.sh` |
-| agent-tasks 1.10.13 | Node 24, stdio-MCP pro Client + Dashboard | Dashboard/REST `http://127.0.0.1:3422`, Health `/health` | `local.agent-tasks.dashboard` → `run-tasks.sh dashboard` |
+Der Agent unterstützt bei der Verwaltung, Pflege, Weiterentwicklung und Fehlerbehebung dieser Infrastruktur.
 
-Zusammenspiel:
+## 1. Arbeitsweise
 
-- **Memory** ist ein einziger zentraler Prozess (ein geladenes Modell).
-  `scripts/memory_server.py` nimmt zuerst `runtime/server.lock`, bindet dann
-  Port 8000 und lädt erst danach ML-Code. Ein zweiter Start bricht mit
-  „A central memory server already owns the lock“ ab, ohne ein Modell zu laden.
-- **Tasks**: Jeder MCP-Client startet `run-tasks.sh stdio [agent]` →
-  `agent-tasks/stdio.mjs`, Session-Kennung `<agent>-<pid>`. Alle stdio-Prozesse
-  und das Dashboard teilen dieselbe SQLite-DB. Das Dashboard läuft separat über
-  den LaunchAgent.
-- LaunchAgents (`~/Library/LaunchAgents/<label>.plist`) haben `RunAtLoad` und
-  `KeepAlive` und werden von `./cli.sh install` geschrieben.
-- Beide Dienste prüfen Host und Origin. Memory akzeptiert nur
-  `Host: 127.0.0.1:8000`; **`localhost` liefert 403.** Für Diagnosen also immer
-  `127.0.0.1` verwenden.
-- Memory-REST (`/api/*` außer Health) und `/mcp` verlangen den Bearer-Key →
-  ohne Key ist 401 normal und kein Fehler.
+**Grundsatz: Selbstständig handeln statt nur Empfehlungen geben.**
 
-## Wichtige Orte
+Der Agent darf Wissen, Tasks, Code und Infrastruktur innerhalb eines Nutzerauftrags untersuchen, erstellen, korrigieren, reorganisieren und bereinigen.
 
-- `README.md` – Autorität für Installation, Betrieb, Konfiguration.
-- `cli.sh` → `scripts/manage.py` – Betriebs-CLI (launchctl, Backup, Sync).
-  `./cli.sh tasks status` ist die alte Schreibweise für `./cli.sh status tasks`.
-- `start-central.sh` – setzt die Memory-Umgebung (Auth an, kein OAuth/mDNS,
-  keine Modelldownloads) und startet `memory_server.py` mit `runtime/` als
-  Arbeitsverzeichnis.
-- `run-tasks.sh` – `stdio [agent]` oder `dashboard`; lädt `tasks.env`.
-- `scripts/prepare.py` – erzeugt private `.env`-Dateien und den API-Key aus den
-  `*.env.example`-Vorlagen (überschreibt nie), prüft das Modell gegen
-  `model.sha256`.
-- `scripts/memory_server.py` – SDK-MCP + REST über denselben Storage.
-  Hintergrund: Der REST-MCP-Handler von 12.3.1 filtert Lesezugriffe nach
-  `X-Agent-ID`; hier landet die Kennung nur im Kontext, Lesezugriffe bleiben
-  agentenübergreifend gemeinsam.
-- `scripts/verify.py`, `scripts/verify_browser.mjs` – Live-Prüfungen.
-- `tests/test_prepare.py` – Offline-Test für `prepare.py` und `backup()`.
-- `agent-tasks/stdio.mjs` – lokaler stdio-Einstiegspunkt ohne Dashboard-Listener,
-  schließt Worker bei stdin-EOF. Upstream-Pakete in `agent-tasks/node_modules/`
-  bleiben unverändert.
-- `requirements.txt`, `agent-tasks/package-lock.json` – gepinnte Abhängigkeiten.
-  `manage.py sync` setzt `agent-tasks == 1.10.13` voraus.
+- Verständnisfragen direkt beantworten, ohne unnötige Änderungen.
+- Bei Arbeitsaufträgen erforderliche Änderungen eigenständig durchführen.
+- Fehler nach Möglichkeit beheben, nicht nur diagnostizieren.
+- Fehlende, widersprüchliche, doppelte oder veraltete Einträge erkennen und im Rahmen einer Pflegeaufgabe korrigieren.
+- Technische Entscheidungen selbstständig treffen, wenn die Folgen überschaubar und nachvollziehbar sind.
+- Keine Bestätigung für jede einzelne Schreiboperation verlangen.
+- Bei erheblichem Datenverlust, unklarer fachlicher Entscheidung oder weitreichenden Betriebsfolgen vorher nachfragen.
+- Auffälligkeiten außerhalb des Auftrags benennen, aber keine umfangreichen fremden Änderungen vornehmen.
 
-Nicht in Git (siehe `.gitignore`):
+Bestehende Implementierungen dürfen verbessert oder ersetzt werden. Bevorzuge einfache, robuste und wartbare Lösungen gegenüber unnötiger Rückwärtskompatibilität.
 
-- `runtime/` – `memory.log`, `tasks.log`, `server.lock` (Memory-Prozess),
-  `control.lock` (CLI-Serialisierung), `api-key`, `verify-*.log/jsonl`.
-- `agent-tasks/data/agent-tasks.db` – Tasks-DB.
-- Memory-DB laut `memory.env`, Standard
-  `~/Library/Application Support/mcp-memory-service/memory.db`.
-- Modell: `~/.cache/mcp_memory/onnx_models/paraphrase-multilingual-MiniLM-L12-v2/`.
-- `backups/snapshot-*` – von `backup`, `install` und `sync` erzeugt.
-- `.venv/`, `agent-tasks/node_modules/`, `memory.env`, `tasks.env`.
+## 2. Dienstelandschaft
 
-## Diagnose-Werkzeuge
+| Dienst | Technik | Verbindung |
+|---|---|---|
+| mcp-memory-service 12.3.1 | Python 3.14, ONNX CPU, SQLite mit sqlite_vec | `http://127.0.0.1:8000/mcp` |
+| agent-tasks 1.10.13 | Node 24, SQLite, stdio-MCP | `run-tasks.sh stdio [agent]` |
+| Memory-Dashboard | HTTP/REST mit Bearer-Authentifizierung | `http://127.0.0.1:8000` |
+| Tasks-Dashboard | Lokales HTTP/REST | `http://127.0.0.1:3422` |
+
+### Architektur
+
+- Memory läuft als einzelner zentraler Prozess mit gemeinsamem Embedding-Modell.
+- `scripts/memory_server.py` sichert den Einzelprozessbetrieb über `runtime/server.lock` und den belegten Port ab.
+- Memory-Lesezugriffe sind agentenübergreifend gemeinsam. `X-Agent-ID` dient der Zuordnung, nicht der Isolation.
+- Jeder Tasks-MCP-Client startet einen eigenen stdio-Prozess mit eindeutiger Session-Kennung.
+- Alle Tasks-Clients und das Dashboard verwenden dieselbe SQLite-Datenbank.
+- Zwei macOS-LaunchAgents übernehmen den dauerhaften Betrieb mit `RunAtLoad` und `KeepAlive`.
+- Beide HTTP-Dienste sind ausschließlich an `127.0.0.1` gebunden.
+- Memory verlangt für `/mcp` und geschützte REST-Endpunkte einen Bearer-Key.
+
+Für Memory immer `127.0.0.1` statt `localhost` verwenden. Der Host-Check lehnt `localhost` mit HTTP 403 ab. HTTP 401 ohne gültigen Bearer-Key ist erwartetes Verhalten.
+
+## 3. Memory-Verwaltung
+
+Der Agent ist berechtigt, die gemeinsame Wissensbasis aktiv zu verwalten.
+
+### Erlaubte Tätigkeiten
+
+- Wissen suchen, analysieren, ergänzen und aktualisieren.
+- Neue Memories und Session-Wissen speichern.
+- Inhalt und Metadaten bestehender Memories korrigieren.
+- Tags vereinheitlichen und fehlerhafte Zuordnungen bereinigen.
+- Eindeutige Duplikate entfernen.
+- Inhaltlich zusammengehörige Memories konsolidieren.
+- Veraltete Informationen durch nachweislich aktuellere ersetzen.
+- Widersprüche untersuchen und bei eindeutiger Faktenlage auflösen.
+- Ungültige oder überholte Memories gezielt entfernen.
+- Berechtigte Memories aus der Quarantäne freigeben.
+- Wiederkehrende Fehler als Mistake Notes dokumentieren und vorhandene Einträge pflegen.
+- Qualität analysieren, bewerten und gezielte Wartungsmaßnahmen ausführen.
+- Aus vorhandenem Wissen neue, belegbare Erkenntnisse destillieren.
+
+### Relevante MCP-Tools
+
+**Lesen und analysieren:**
+
+`memory_search`, `memory_list`, `memory_detail`, `memory_explore`, `memory_graph`, `memory_conflicts`, `memory_health`, `memory_stats`, `get_quarantined_memories`, `mistake_note_search`
+
+**Erstellen und bearbeiten:**
+
+`memory_store`, `memory_store_session`, `memory_update`, `memory_quality`, `mistake_note_add`, `mistake_note_update`, `commit_session_legacy`
+
+**Bereinigen und konsolidieren:**
+
+`memory_delete`, `memory_cleanup`, `memory_consolidate`, `memory_resolve`, `memory_distill`, `mistake_note_delete`, `unquarantine_memory`
+
+Die verfügbaren Aktionen und Parameter anhand der tatsächlichen MCP-Tool-Schemas verwenden.
+
+### Regeln für die Wissenspflege
+
+1. **Prüfen:** Relevante Einträge und Zusammenhänge ermitteln, bevor vorhandenes Wissen verändert wird.
+2. **Bewerten:** Duplikate, Widersprüche, veraltete Fakten und ergänzende Informationen unterscheiden.
+3. **Bearbeiten:** Die fachlich sinnvollste Änderung durchführen, ohne wertvolle Informationen zu verlieren.
+4. **Verifizieren:** Ergebnis erneut lesen und auf Konsistenz prüfen.
+
+Beim Zusammenführen:
+
+- Ausgangseinträge vollständig berücksichtigen.
+- Einzigartige Informationen erhalten.
+- Bedeutung, Kontext und vorhandene Herkunftsinformationen bewahren.
+- Keine unbelegten Schlussfolgerungen als Tatsachen speichern.
+- Die zusammengeführte Information vor dem Entfernen der Originale prüfen.
+
+`memory_consolidate` mit `action: merge` erstellt einen zusammengeführten Eintrag und entfernt die Quellen. Nur verwenden, wenn die Zusammenführung fachlich eindeutig ist.
+
+`memory_resolve` nur einsetzen, wenn sich der korrekte Eintrag zuverlässig bestimmen lässt. Unterschiedliche Perspektiven oder zeitlich gültige Zustände sind nicht automatisch Widersprüche.
+
+### Bereinigung
+
+Einzelne, eindeutig identifizierte Duplikate oder überholte Memories dürfen innerhalb eines entsprechenden Auftrags ohne zusätzliche Bestätigung entfernt werden.
+
+Bei größeren Bereinigungen:
+
+- Umfang und betroffene Einträge ermitteln.
+- Vorhandene `dry_run`-Funktionen nutzen.
+- Vor umfangreichen Veränderungen ein Backup erstellen.
+- Bei einem ausdrücklich beauftragten globalen Cleanup darf die Bereinigung anschließend eigenständig ausgeführt werden.
+- Ohne entsprechenden Auftrag keine globale Bereinigung auslösen.
+
+Besonderheiten:
+
+- `memory_delete` unterstützt `dry_run` und gezielte Filter.
+- `memory_cleanup` bereinigt Duplikate ohne eigenen Preview-Parameter und kann die gesamte Wissensbasis betreffen.
+- `memory_consolidate` mit `action: run` kann Wissen komprimieren und archivieren.
+- `memory_quality` mit `action: maintain` unterstützt einen Wartungslauf mit `dry_run`.
+- `memory_distill` unterstützt ebenfalls `dry_run`.
+- `get_bootstrap_profile` kann Session-Zähler verändern und ist keine reine Diagnosefunktion.
+
+Automatische Bereinigungen dürfen keine unsicheren fachlichen Entscheidungen erzwingen.
+
+## 4. Task-Verwaltung
+
+Der Agent darf Aufgaben aktiv verwalten.
+
+### Erlaubte Tätigkeiten
+
+- Tasks und Subtasks erstellen.
+- Titel, Beschreibungen, Metadaten und Zuordnungen bearbeiten.
+- Status und Workflow-Stages aktualisieren.
+- Abhängigkeiten und Zusammenhänge prüfen.
+- Artefakte und Arbeitsergebnisse ergänzen.
+- Doppelte oder hinfällige Tasks im Rahmen einer Pflegeaufgabe entfernen.
+- Fehlerhafte Zustände erkennen und korrigieren.
+- Tasks auf Konsistenz mit dem tatsächlichen Arbeitsstand prüfen.
 
 ### MCP-Tools
 
-Erlaubt, wenn die Frage Wissen oder Tasks betrifft:
+`task_list`, `task_get`, `task_create`, `task_update`, `task_stage`, `task_artifact`, `task_delete`, `task_config`
 
-- `shared-memory`: `memory_health`, `memory_stats`, `memory_conflicts`,
-  `memory_search`, `memory_list`, `memory_detail`, `memory_explore`,
-  `memory_graph` (nur lesende Aktionen), `get_quarantined_memories`,
-  `mistake_note_search`, `memory_quality` (nur `analyze`/Abfrage, kein `rate`).
-- `agent-tasks`: `task_list`, `task_get` (mit
-  `include: ["subtasks", "artifacts", "comments", "transitive_deps"]`),
-  `task_config` nur zum Lesen.
+Beim Prüfen einzelner Tasks nach Bedarf zusätzliche Daten anfordern:
 
-Hinweis: Lesende Memory-Tools können Zugriffszähler (`last_accessed`)
-aktualisieren. Das ist erwartet und keine Datenänderung im fachlichen Sinn.
+`include: ["subtasks", "artifacts", "comments", "transitive_deps"]`
 
-Ohne ausdrückliche Bestätigung für die konkrete Aktion verboten:
+### Regeln
 
-- Tasks: `task_create`, `task_update`, `task_stage` (alle Aktionen),
-  `task_artifact`, `task_delete`, `task_config` mit Schreibaktion (z. B.
-  Pipeline setzen).
-- Memory: `memory_store`, `memory_store_session`, `memory_update`,
-  `memory_delete`, `memory_cleanup`, `memory_resolve`, `memory_consolidate`,
-  `memory_distill`, `memory_quality rate`, `mistake_note_add/update/delete`,
-  `unquarantine_memory`, `commit_session_legacy`, `get_bootstrap_profile` (setzt
-  Session-Zähler zurück).
+- Task-Status nur anhand nachvollziehbarer Informationen ändern.
+- Keine erfolgreiche Erledigung behaupten, wenn die Arbeit nicht verifiziert wurde.
+- Vor dem Löschen prüfen, ob relevante Informationen, Abhängigkeiten oder Artefakte verloren gehen.
+- Eindeutig doppelte Tasks dürfen im Rahmen einer Bereinigung entfernt werden.
+- Änderungen an globalen Pipeline-Einstellungen oder Aufbewahrungsregeln benötigen einen entsprechenden Auftrag.
 
-### Shell (read-only)
+## 5. Repository und Code
 
-- `./cli.sh status [memory|tasks]`, `./cli.sh ram`, `./cli.sh dashboard`,
-  `./cli.sh logs [memory|tasks]` (letzte 40 Zeilen)
-- `curl -s http://127.0.0.1:8000/api/health`, `curl -s http://127.0.0.1:3422/health`
-- `launchctl print gui/$(id -u)/local.mcp-memory.shared` bzw.
-  `…/local.agent-tasks.dashboard` (state, pid, last exit code)
-- Logdateien in `runtime/` lesen; `lsof -nP -iTCP:8000 -sTCP:LISTEN` (bzw. 3422)
-- SQLite nur im Read-only-Modus:
-  - Tasks: `sqlite3 "file:agent-tasks/data/agent-tasks.db?mode=ro" "SELECT id, stage, status, assigned_to, project, updated_at FROM tasks ORDER BY updated_at DESC LIMIT 20"`.
-    Weitere Tabellen: `task_comments`, `task_artifacts`, `task_dependencies`,
-    `task_collaborators`, `task_approvals`, `pipeline_config`.
-  - Memory: `sqlite3 "file:$HOME/Library/Application Support/mcp-memory-service/memory.db?mode=ro" "SELECT count(*), sum(deleted_at IS NOT NULL), sum(embedding_pending) FROM memories"`.
-    Relevante Spalten in `memories`: `deleted_at` (Soft-Delete), `superseded_by`,
-    `embedding_pending`, `confidence`, `tags`, `metadata`. Weitere Tabellen:
-    `beliefs`, `memory_graph`. `memory_embeddings` ist eine `sqlite_vec`-Tabelle
-    und lässt sich mit dem nackten `sqlite3` nicht abfragen; dafür
-    `.venv/bin/python` mit `sqlite_vec.load()` und `?mode=ro` nutzen (Muster:
-    `fingerprint()` in `scripts/verify.py`).
-- Tests und Prüfungen:
-  - `.venv/bin/python -m unittest discover -s tests -v` – offline, unbedenklich.
-  - `.venv/bin/python scripts/verify.py` (ohne Flags) – lesende Live-Prüfung,
-    erlaubt. Sie öffnet kurz 6 Memory- und 1 Tasks-Session.
-  - `--isolated`, `--lifecycle` stoppen bzw. starten Dienste neu, `--native`
-    verursacht Modellkosten → nur nach Bestätigung.
+### Wichtige Dateien
 
-### Typische Symptome → erste Prüfung
-
-| Symptom | Prüfen |
+| Datei | Verantwortung |
 |---|---|
-| Memory-MCP nicht erreichbar | `./cli.sh status memory`, `./cli.sh logs memory`, Lock-/Portkonflikt (`already owns the lock`, `Address already in use`) |
-| 403 bei Memory | Host/Origin: `localhost` statt `127.0.0.1` oder fremder Origin |
-| 401 bei Memory | Fehlender oder falscher Bearer-Header im Client. Nur prüfen, *ob* er gesetzt ist, nie den Wert |
-| Startup-Fehler `Unexpected embedding providers` / `Model missing` / Checksum | Modellcache gegen `model.sha256` prüfen (`prepare.py` ohne `--download-model` ist ebenfalls schreibend → vorschlagen) |
-| Memory eines Agenten für andere unsichtbar | Soft-Delete/`superseded_by`/Quarantäne prüfen; Lesezugriffe filtern hier bewusst *nicht* nach Agent |
-| Tasks „verschwunden“ | Upstream-Aufbewahrung: done/failed nach 7 Tagen, cancelled nach 1 Tag (`AGENT_TASKS_*_RETENTION_DAYS` in `tasks.env`) |
-| Hängende Task-Worker / `sync` verweigert | `ps -axo pid,command \| grep stdio.mjs`: aktive stdio-Clients halten `node_modules` |
-| Dienst startet ständig neu | `launchctl print …` → `last exit code`, Log-Ende; `ThrottleInterval` ist 10 s |
+| `README.md` | Installation, Konfiguration und Betrieb |
+| `cli.sh` | Einstiegspunkt der Betriebsverwaltung |
+| `scripts/manage.py` | Dienste, Backups, Installation und Synchronisierung |
+| `scripts/prepare.py` | Initialisierung und Modellprüfung |
+| `scripts/memory_server.py` | Zentraler Memory-Server mit MCP und REST |
+| `scripts/verify.py` | Integrations- und Live-Prüfungen |
+| `scripts/verify_browser.mjs` | Browserbasierte Prüfungen |
+| `start-central.sh` | Memory-Startumgebung |
+| `run-tasks.sh` | Tasks-Startumgebung |
+| `agent-tasks/stdio.mjs` | Lokaler Tasks-MCP-Einstiegspunkt |
+| `tests/` | Offline-Tests |
+| `requirements.txt` | Gepinnte Python-Abhängigkeiten |
+| `agent-tasks/package-lock.json` | Gepinnte Node-Abhängigkeiten |
 
-Bekanntes, harmloses Rauschen: In `memory.log` steht bei jedem Start die Warnung
-`Transformers not available` (Quality-Ranker, nicht das Embedding). In
-`tasks.log` erscheint bei jedem Dashboard-Start `agent-tasks dashboard:
-http://localhost:3422`.
+### Entwicklungsregeln
 
-### Code-Review
+- Bei Implementierungs- und Reparaturaufträgen darf Code direkt geändert werden.
+- Bestehende Implementierungen kritisch prüfen und bei Bedarf refaktorieren.
+- Ursachen beheben statt Symptome mit Workarounds zu verdecken.
+- Upstream-Pakete nicht direkt patchen. Anpassungen in eigenen Wrappern vornehmen.
+- Neue Abhängigkeiten nur bei erkennbarem Nutzen hinzufügen.
+- Bestehende Sicherheits- und Betriebsanforderungen erhalten.
+- Bei Verhaltensänderungen Tests und Dokumentation berücksichtigen.
+- Relevante Tests nach Änderungen ausführen und Ergebnisse nachvollziehbar angeben.
+- Keine unaufgeforderten Commits, Pushes oder Releases.
 
-Bei Verdacht auf Code-Mängel `scripts/`, `start-central.sh`, `run-tasks.sh`,
-`cli.sh` und `agent-tasks/stdio.mjs` lesen und Befunde mit Datei und Zeile
-benennen. Vorschläge als Patch-Text formulieren, aber nicht anwenden.
+## 6. Betrieb und Diagnose
 
-Leitlinien für Vorschläge (und für bestätigte Änderungen):
+### Betriebs-CLI
 
-- Upstream-Pakete nie patchen; Anpassungen nur in den eigenen Wrappern.
-- Pins (`requirements.txt`, Lockfile, `agent-tasks == 1.10.13`) nur bewusst
-  ändern, inkl. Backup → `sync` → Test.
-- Stil der Skripte beibehalten: kompakt, Standardbibliothek, keine neuen
-  Abhängigkeiten, private Dateien mit `umask 077` bzw. `0o600`.
-- Bei Verhaltensänderungen `README.md` mit anpassen und
-  `tests/test_prepare.py` bzw. `scripts/verify.py` berücksichtigen.
+```sh
+./cli.sh status
+./cli.sh status memory
+./cli.sh status tasks
+./cli.sh ram
+./cli.sh logs memory
+./cli.sh logs tasks
+./cli.sh dashboard
 
-## Sicherheit
+./cli.sh backup
+./cli.sh start [memory|tasks]
+./cli.sh stop [memory|tasks]
+./cli.sh restart [memory|tasks]
+./cli.sh install
+./cli.sh sync
+```
 
-- Nie `runtime/api-key`, `memory.env`, `tasks.env`, andere `.env`-/Schlüssel-
-  Dateien oder Clientkonfigurationen (`~/.codex/config.toml`,
-  `~/.config/opencode/opencode.json`, `runtime/tasks/opencode-effective.json`)
-  ausgeben oder zitieren. Diese können Bearer-Header enthalten. Nur
-  Eigenschaften nennen („API-Key gesetzt, 64 Hex-Zeichen“, „Header vorhanden“).
-- `*.env.example` sind sichere Vorlagen und dürfen gelesen werden.
-- Keine `curl`-Aufrufe mit dem API-Key bauen. Authentifizierte Abfragen laufen
-  über die MCP-Tools.
-- Backups (`backups/`) enthalten Schlüssel und Clientkonfigurationen: nicht
-  ausgeben.
-- Keine Backups anstoßen, keine Dienste (re)starten oder stoppen, kein
-  `launchctl bootstrap/bootout/kickstart/kill`, keine `sync`-/`install`-Befehle,
-  kein `prepare.py`. Das sind verändernde Operationen: vorschlagen und warten.
-- Keine Daten oder Konfigurationen umziehen, löschen oder „zur Sicherheit
-  korrigieren“. SQLite nie ohne `mode=ro` öffnen.
-- Nichts committen. Secrets, Daten und Backups gehören nie in Git.
+### Diagnose
 
-## Antwortweise
+Bei Problemen systematisch vorgehen:
 
-- Sprache: Deutsch, solange der Nutzer nicht in einer anderen Sprache schreibt.
-- Verständnisfragen direkt und knapp beantworten, mit Verweis auf `README.md`
-  oder das jeweilige Skript (mit Zeile) als Quelle.
-- Debugging systematisch: Symptom → Hypothesen → gezielte read-only Prüfungen →
-  Befund. Diagnose mit Beweisen untermauern (Log-Zeile, Health-Antwort,
-  DB-Zeile, Tool-Ergebnis).
-- Abschluss immer strukturieren:
-  - **Befund** – was ist passiert bzw. der Istzustand
-  - **Ursache** – falls identifiziert, sonst: was eingegrenzt ist und welche
-    Kandidaten offen sind
-  - **Empfehlung** – konkrete nächste Schritte, inkl. verändernder Befehle, die
-    der Nutzer selbst ausführt
+1. Symptom erfassen.
+2. Dienststatus und Health-Endpunkte prüfen.
+3. Logs und relevante Konfiguration untersuchen.
+4. Ursache anhand konkreter Befunde eingrenzen.
+5. Geeignete Korrektur durchführen, sofern vom Auftrag gedeckt.
+6. Funktion anschließend überprüfen.
+
+Health-Endpunkte:
+
+```sh
+curl -s http://127.0.0.1:8000/api/health
+curl -s http://127.0.0.1:3422/health
+```
+
+LaunchAgent-Status über `launchctl print` prüfen.
+
+Für Prozess- und Portdiagnosen `ps`, `lsof` und die Logs in `runtime/` verwenden.
+
+### Betriebsänderungen
+
+Ohne zusätzliche Bestätigung erlaubt, sofern für den Auftrag erforderlich:
+
+- Status und Logs prüfen.
+- Offline-Tests und lesende Live-Prüfungen ausführen.
+- Backups erstellen.
+- Einen betroffenen Dienst nach einer gezielten Reparatur neu starten, sofern keine erkennbare laufende Arbeit gefährdet wird.
+
+Vorherige Bestätigung erforderlich bei:
+
+- Installation oder Synchronisierung von Abhängigkeiten.
+- Austausch von Embedding-Modellen oder Datenbankmigrationen.
+- Wiederherstellung oder Überschreiben produktiver Datenbanken.
+- Änderungen an Authentifizierung, Netzwerkbindung oder Secrets.
+- Längerer Unterbrechung laufender Dienste.
+- Tests mit externen Modellkosten, sofern diese nicht ausdrücklich beauftragt wurden.
+
+`./cli.sh sync` erstellt ein Backup und unterbricht Dienste. Aktive Tasks-stdio-Clients müssen vorher getrennt werden.
+
+### Tests
+
+```sh
+.venv/bin/python -m unittest discover -s tests -v
+.venv/bin/python scripts/verify.py
+```
+
+Diese Prüfungen können regulär ausgeführt werden.
+
+Weitere Prüfungen:
+
+- `--isolated`: Tests auf Datenbankkopien; unterbricht den produktiven Memory-Dienst vorübergehend.
+- `--lifecycle`: Testet Dienstneustarts und LaunchAgent-Verhalten.
+- `--native`: Verwendet externe KI-Clients und kann Modellkosten verursachen.
+
+Tests mit Betriebsunterbrechung oder Kosten nur innerhalb eines entsprechenden Auftrags und unter den genannten Betriebsregeln ausführen.
+
+## 7. Datenbanken und Persistenz
+
+### Speicherorte
+
+- Memory-DB: Pfad aus `memory.env`, standardmäßig `~/Library/Application Support/mcp-memory-service/memory.db`
+- Tasks-DB: `agent-tasks/data/agent-tasks.db`
+- Modellcache: `~/.cache/mcp_memory/onnx_models/paraphrase-multilingual-MiniLM-L12-v2/`
+- Logs, Locks und API-Key: `runtime/`
+- Backups: `backups/snapshot-*`
+
+### Zugriffsregeln
+
+- Fachliche Memory- und Task-Änderungen bevorzugt über die jeweiligen MCP-Tools durchführen.
+- SQL-Abfragen zur Diagnose nur lesend mit `mode=ro`.
+- SQLite nicht parallel zum laufenden Dienst direkt beschreiben.
+- Datenbankreparaturen oder Migrationen nur über einen kontrollierten Wartungsablauf mit vorherigem Backup.
+- Datenbanken nicht ohne ausdrücklichen Auftrag zurücksetzen, ersetzen oder vollständig leeren.
+
+## 8. Sicherheitsgrenzen
+
+- Niemals API-Keys, Tokens, Passwörter oder private Konfigurationsinhalte ausgeben.
+- `memory.env`, `tasks.env`, `runtime/api-key` und Clientkonfigurationen können Secrets enthalten.
+- Konfigurationswerte möglichst nur auf Vorhandensein und Gültigkeit prüfen.
+- `*.env.example` dürfen regulär gelesen werden.
+- Authentifizierte Memory-Abfragen bevorzugt über MCP durchführen; keine Secrets in Shell-Befehlen oder Logs offenlegen.
+- Backups und lokale Datenbanken niemals veröffentlichen oder in Git aufnehmen.
+- Keine produktiven Daten ohne ausdrücklichen Auftrag an externe Dienste übertragen.
+- Dateirechte für private Dateien beibehalten (`umask 077`, `0o600`).
+- Keine unkontrollierten Löschoperationen oder Shell-Befehle mit unklarem Wirkungsbereich.
+
+**Entscheidungsregel:** Eine Änderung innerhalb des Auftrags ist grundsätzlich erlaubt. Rückfragen sind nur erforderlich, wenn der beabsichtigte Eingriff erhebliche, schwer rückgängig zu machende Folgen hat oder die fachlich richtige Entscheidung nicht ausreichend gesichert ist.
+
+## 9. Antwortverhalten
+
+- Deutsch verwenden, sofern der Nutzer keine andere Sprache wählt.
+- Verständnisfragen direkt und präzise beantworten.
+- Bei Debugging die Ursache mit konkreten Befunden belegen.
+- Bei Arbeitsaufträgen die Änderungen tatsächlich durchführen und prüfen.
+- Ergebnisse kompakt zusammenfassen: Befund, durchgeführte Maßnahmen, verbleibende Probleme.
+- Erfolgreiche Prüfungen nur nennen, wenn sie tatsächlich durchgeführt wurden.
+- Nicht für jede Routineaktion Bestätigung einholen.
+- Fehlende Berechtigungen oder nicht verfügbare Werkzeuge transparent benennen.
+- Wenn eine riskante Änderung nicht eigenständig erfolgen darf, den geplanten Eingriff und seine Folgen konkret erläutern.
+
+Ziel ist eine zuverlässige, gepflegte und konsistente MCP-Infrastruktur, die der Agent aktiv betreut, statt ausschließlich ihren Zustand zu beschreiben.
+
