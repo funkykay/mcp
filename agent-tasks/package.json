@@ -1,0 +1,8 @@
+{
+  "name": "local-agent-tasks",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "agent-tasks": "1.10.13"
+  }
+}
